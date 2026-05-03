@@ -1,0 +1,8 @@
+samples:
+  - SampleA
+  - SampleB
+
+raw_reads_dir: "data/raw"
+human_ref_index: "refs/GRCh38/GRCh38"         # bowtie2-build index prefix for GRCh38
+metaphlan_db:    "refs/metaphlan_db"            # directory containing MetaPhlAn4 database
+metaphlan_index: "mpa_vOct22_CHOCOPhlAnSGB_202212"

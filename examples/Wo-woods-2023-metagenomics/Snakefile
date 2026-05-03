@@ -1,0 +1,278 @@
+configfile: "config.yaml"
+
+SAMPLES = config["samples"]
+
+rule all:
+    input:
+        "results/multiqc/multiqc_report.html",
+        "results/metaphlan/merged_abundance_table.txt",
+        expand("results/checkm2/{sample}/quality_report.tsv", sample=SAMPLES),
+
+
+rule fastqc_raw:
+    input:
+        r1 = config["raw_reads_dir"] + "/{sample}_R1.fastq.gz",
+        r2 = config["raw_reads_dir"] + "/{sample}_R2.fastq.gz",
+    output:
+        html_r1 = "results/fastqc/raw/{sample}_R1_fastqc.html",
+        html_r2 = "results/fastqc/raw/{sample}_R2_fastqc.html",
+        zip_r1  = "results/fastqc/raw/{sample}_R1_fastqc.zip",
+        zip_r2  = "results/fastqc/raw/{sample}_R2_fastqc.zip",
+    threads: 2
+    shell:
+        "fastqc {input.r1} {input.r2} --outdir results/fastqc/raw/ --threads {threads}"
+
+
+rule fastp:
+    input:
+        r1 = config["raw_reads_dir"] + "/{sample}_R1.fastq.gz",
+        r2 = config["raw_reads_dir"] + "/{sample}_R2.fastq.gz",
+    output:
+        r1   = "results/fastp/{sample}/{sample}_R1.fastq.gz",
+        r2   = "results/fastp/{sample}/{sample}_R2.fastq.gz",
+        json = "results/fastp/{sample}/{sample}.json",
+        html = "results/fastp/{sample}/{sample}.html",
+    threads: 8
+    shell:
+        """
+        fastp \
+            -i {input.r1} -I {input.r2} \
+            -o {output.r1} -O {output.r2} \
+            --json {output.json} --html {output.html} \
+            --detect_adapter_for_pe \
+            --qualified_quality_phred 20 \
+            --length_required 50 \
+            --thread {threads}
+        """
+
+
+rule remove_host:
+    input:
+        r1 = "results/fastp/{sample}/{sample}_R1.fastq.gz",
+        r2 = "results/fastp/{sample}/{sample}_R2.fastq.gz",
+    output:
+        r1 = "results/host_removed/{sample}/{sample}_R1.fastq.gz",
+        r2 = "results/host_removed/{sample}/{sample}_R2.fastq.gz",
+    params:
+        index  = config["human_ref_index"],
+        tmpdir = "results/host_removed/{sample}/sorttmp",
+    threads: 16
+    shell:
+        """
+        mkdir -p {params.tmpdir}
+        bowtie2 \
+            -x {params.index} \
+            -1 {input.r1} -2 {input.r2} \
+            --threads {threads} \
+            --very-sensitive \
+        | samtools view -bS -f 12 -F 256 - \
+        | samtools sort -n -T {params.tmpdir} - \
+        | samtools fastq \
+            -1 {output.r1} \
+            -2 {output.r2} \
+            -0 /dev/null -s /dev/null \
+            -N -
+        rm -rf {params.tmpdir}
+        """
+
+
+rule metaphlan:
+    input:
+        r1 = "results/host_removed/{sample}/{sample}_R1.fastq.gz",
+        r2 = "results/host_removed/{sample}/{sample}_R2.fastq.gz",
+    output:
+        profile    = "results/metaphlan/{sample}_profile.txt",
+        bowtie2out = "results/metaphlan/{sample}.bowtie2.bz2",
+    params:
+        db    = config["metaphlan_db"],
+        index = config["metaphlan_index"],
+    threads: 8
+    shell:
+        """
+        metaphlan \
+            {input.r1},{input.r2} \
+            --input_type fastq \
+            --bowtie2db {params.db} \
+            --index {params.index} \
+            --bowtie2out {output.bowtie2out} \
+            --nproc {threads} \
+            -o {output.profile}
+        """
+
+
+rule merge_metaphlan_profiles:
+    input:
+        expand("results/metaphlan/{sample}_profile.txt", sample=SAMPLES),
+    output:
+        "results/metaphlan/merged_abundance_table.txt",
+    shell:
+        "merge_metaphlan_tables.py {input} > {output}"
+
+
+rule megahit:
+    input:
+        r1 = "results/host_removed/{sample}/{sample}_R1.fastq.gz",
+        r2 = "results/host_removed/{sample}/{sample}_R2.fastq.gz",
+    output:
+        contigs = "results/assembly/{sample}/final.contigs.fa",
+    params:
+        outdir = "results/assembly/{sample}",
+        tmpdir = "results/assembly/{sample}_tmp",
+    threads: 16
+    shell:
+        """
+        rm -rf {params.outdir}
+        megahit \
+            -1 {input.r1} -2 {input.r2} \
+            -o {params.outdir} \
+            --min-contig-len 1000 \
+            --tmp-dir {params.tmpdir} \
+            -t {threads}
+        """
+
+
+rule map_reads_to_assembly:
+    input:
+        contigs = "results/assembly/{sample}/final.contigs.fa",
+        r1      = "results/host_removed/{sample}/{sample}_R1.fastq.gz",
+        r2      = "results/host_removed/{sample}/{sample}_R2.fastq.gz",
+    output:
+        bam = "results/binning/{sample}/{sample}_vs_assembly.bam",
+        bai = "results/binning/{sample}/{sample}_vs_assembly.bam.bai",
+    params:
+        bt2_index = "results/binning/{sample}/{sample}_assembly",
+    threads: 16
+    shell:
+        """
+        bowtie2-build --threads {threads} {input.contigs} {params.bt2_index}
+        bowtie2 \
+            -x {params.bt2_index} \
+            -1 {input.r1} -2 {input.r2} \
+            --threads {threads} \
+            --no-unal \
+        | samtools sort -@ {threads} -o {output.bam}
+        samtools index {output.bam}
+        """
+
+
+rule contig_depths:
+    input:
+        bam = "results/binning/{sample}/{sample}_vs_assembly.bam",
+    output:
+        depth = "results/binning/{sample}/{sample}_depth.txt",
+    shell:
+        "jgi_summarize_bam_contig_depths --outputDepth {output.depth} {input.bam}"
+
+
+rule metabat2:
+    input:
+        contigs = "results/assembly/{sample}/final.contigs.fa",
+        depth   = "results/binning/{sample}/{sample}_depth.txt",
+    output:
+        done = touch("results/binning/metabat2/{sample}/.done"),
+    params:
+        prefix = "results/binning/metabat2/{sample}/bin",
+    threads: 8
+    shell:
+        """
+        mkdir -p results/binning/metabat2/{wildcards.sample}
+        metabat2 \
+            -i {input.contigs} \
+            -a {input.depth} \
+            -o {params.prefix} \
+            --minContig 2500 \
+            -t {threads}
+        """
+
+
+rule maxbin2:
+    input:
+        contigs = "results/assembly/{sample}/final.contigs.fa",
+        r1      = "results/host_removed/{sample}/{sample}_R1.fastq.gz",
+        r2      = "results/host_removed/{sample}/{sample}_R2.fastq.gz",
+    output:
+        done = touch("results/binning/maxbin2/{sample}/.done"),
+    params:
+        prefix = "results/binning/maxbin2/{sample}/bin",
+        outdir = "results/binning/maxbin2/{sample}",
+    threads: 8
+    shell:
+        """
+        mkdir -p {params.outdir}
+        run_MaxBin.pl \
+            -contig {input.contigs} \
+            -reads {input.r1} \
+            -reads2 {input.r2} \
+            -out {params.prefix} \
+            -thread {threads} \
+            -min_contig_length 2500
+        """
+
+
+rule das_tool:
+    input:
+        contigs      = "results/assembly/{sample}/final.contigs.fa",
+        metabat_done = "results/binning/metabat2/{sample}/.done",
+        maxbin_done  = "results/binning/maxbin2/{sample}/.done",
+    output:
+        done = touch("results/binning/dastool/{sample}/.done"),
+    params:
+        metabat_dir = "results/binning/metabat2/{sample}",
+        maxbin_dir  = "results/binning/maxbin2/{sample}",
+        metabat_s2b = "results/binning/dastool/{sample}/metabat2.s2b.tsv",
+        maxbin_s2b  = "results/binning/dastool/{sample}/maxbin2.s2b.tsv",
+        outprefix   = "results/binning/dastool/{sample}/{sample}",
+        outdir      = "results/binning/dastool/{sample}",
+    threads: 8
+    shell:
+        """
+        mkdir -p {params.outdir}
+        Fasta_to_Scaffolds2Bin.sh -e fa    -i {params.metabat_dir} > {params.metabat_s2b}
+        Fasta_to_Scaffolds2Bin.sh -e fasta -i {params.maxbin_dir}  > {params.maxbin_s2b}
+        DAS_Tool \
+            -i {params.metabat_s2b},{params.maxbin_s2b} \
+            -l metabat2,maxbin2 \
+            -c {input.contigs} \
+            -o {params.outprefix} \
+            --write_bins \
+            --threads {threads} \
+            --search_engine diamond
+        """
+
+
+rule checkm2:
+    input:
+        done = "results/binning/dastool/{sample}/.done",
+    output:
+        report = "results/checkm2/{sample}/quality_report.tsv",
+    params:
+        bins_dir = "results/binning/dastool/{sample}/{sample}_DASTool_bins",
+        outdir   = "results/checkm2/{sample}",
+    threads: 16
+    shell:
+        """
+        checkm2 predict \
+            --input {params.bins_dir} \
+            -x fa \
+            --output-directory {params.outdir} \
+            --threads {threads} \
+            --force
+        """
+
+
+rule multiqc:
+    input:
+        expand("results/fastqc/raw/{sample}_{read}_fastqc.zip", sample=SAMPLES, read=["R1", "R2"]),
+        expand("results/fastp/{sample}/{sample}.json", sample=SAMPLES),
+    output:
+        report = "results/multiqc/multiqc_report.html",
+    params:
+        outdir = "results/multiqc",
+    shell:
+        """
+        multiqc \
+            results/fastqc/raw \
+            results/fastp \
+            -o {params.outdir} \
+            --force
+        """
